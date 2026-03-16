@@ -1,0 +1,37 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: mf_timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mfuser
+      POSTGRES_PASSWORD: mfpassword
+      POSTGRES_DB: mutualfunds
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mfuser -d mutualfunds"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: mf_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  timescale_data:
+  redis_data:
