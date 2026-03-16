@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,8 +23,8 @@ const (
 	syncRunIDKey      = "sync:run_id"
 )
 
-// All windows we compute analytics for
 var analyticsWindows = []string{"1Y", "3Y", "5Y", "10Y"}
+var sortByOptions = []string{"median_return", "max_drawdown"}
 
 type SyncStatus struct {
 	RunID          string     `json:"run_id"`
@@ -116,14 +117,12 @@ func (p *Pipeline) Trigger(ctx context.Context) (string, error) {
 	return runID, nil
 }
 
-// run is the main pipeline loop — sequential processing
+// run is the main pipeline loop
 func (p *Pipeline) run(ctx context.Context, runID string) {
 	p.logger.Info("pipeline run started", zap.String("run_id", runID))
 
-	// Channel to pass scheme codes to analytics worker
 	analyticsQueue := make(chan string, len(p.schemeCodes))
 
-	// Analytics worker runs concurrently with fetching
 	var analyticsWg sync.WaitGroup
 	analyticsWg.Add(1)
 	go func() {
@@ -131,7 +130,6 @@ func (p *Pipeline) run(ctx context.Context, runID string) {
 		p.analyticsWorker(ctx, analyticsQueue)
 	}()
 
-	// Collect all scheme codes from Redis queue
 	var schemes []string
 	for {
 		result, err := p.rdStore.Client.LPop(ctx, syncQueueKey).Result()
@@ -146,7 +144,6 @@ func (p *Pipeline) run(ctx context.Context, runID string) {
 	processed := 0
 	failed := 0
 
-	// Sequential processing — rate limiter is the bottleneck anyway
 	for _, schemeCode := range schemes {
 		p.setStatus(ctx, &SyncStatus{
 			RunID:         runID,
@@ -171,14 +168,24 @@ func (p *Pipeline) run(ctx context.Context, runID string) {
 			continue
 		}
 
-		// Signal analytics worker
 		analyticsQueue <- schemeCode
 		processed++
 	}
 
-	// Close analytics queue and wait for it to finish
 	close(analyticsQueue)
 	analyticsWg.Wait()
+
+	// Pre-compute rankings for all categories + windows + sort options
+	p.logger.Info("pre-computing rankings")
+	p.computeAndStoreAllRankings(ctx)
+
+	now := time.Now().UTC()
+	p.setStatus(ctx, &SyncStatus{
+		RunID:       runID,
+		Status:      "completed",
+		Phase:       "done",
+		CompletedAt: &now,
+	})
 
 	p.logger.Info("pipeline fetch phase complete",
 		zap.Int("processed", processed),
@@ -186,8 +193,124 @@ func (p *Pipeline) run(ctx context.Context, runID string) {
 	)
 }
 
+// computeAndStoreAllRankings pre-computes rankings for all categories + windows + sort options
+func (p *Pipeline) computeAndStoreAllRankings(ctx context.Context) {
+	rows, err := p.tsStore.Pool.Query(ctx, `
+		SELECT DISTINCT category FROM funds WHERE category != ''
+	`)
+	if err != nil {
+		p.logger.Error("failed to get categories", zap.Error(err))
+		return
+	}
+	defer rows.Close()
+
+	var categories []string
+	for rows.Next() {
+		var cat string
+		if err := rows.Scan(&cat); err != nil {
+			continue
+		}
+		categories = append(categories, cat)
+	}
+
+	for _, category := range categories {
+		for _, window := range analyticsWindows {
+			for _, sortBy := range sortByOptions {
+				if err := p.computeRankingForCategory(ctx, category, window, sortBy); err != nil {
+					p.logger.Error("failed to compute ranking",
+						zap.String("category", category),
+						zap.String("window", window),
+						zap.String("sort_by", sortBy),
+						zap.Error(err),
+					)
+					continue
+				}
+				p.logger.Debug("ranking computed",
+					zap.String("category", category),
+					zap.String("window", window),
+					zap.String("sort_by", sortBy),
+				)
+			}
+		}
+	}
+
+	p.logger.Info("all rankings pre-computed",
+		zap.Int("categories", len(categories)),
+		zap.Int("windows", len(analyticsWindows)),
+		zap.Int("sort_options", len(sortByOptions)),
+	)
+}
+
+// computeRankingForCategory computes and stores ranking for one category+window+sortBy
+func (p *Pipeline) computeRankingForCategory(ctx context.Context, category, window, sortBy string) error {
+	// 1. Get all funds for category
+	funds, err := p.tsStore.GetAllFunds(ctx, category, "")
+	if err != nil || len(funds) == 0 {
+		return fmt.Errorf("no funds for category %s", category)
+	}
+
+	// 2. Get all analytics in one query
+	analyticsMap, err := p.tsStore.GetAllAnalyticsForCategory(ctx, category, window)
+	if err != nil {
+		return fmt.Errorf("get analytics: %w", err)
+	}
+
+	// 3. Build entries — NAV already in funds table, no extra query needed
+	var entries []redisstore.RankEntry
+	for _, fund := range funds {
+		result, ok := analyticsMap[fund.SchemeCode]
+		if !ok {
+			continue
+		}
+		entries = append(entries, redisstore.RankEntry{
+			FundCode:     fund.SchemeCode,
+			FundName:     fund.FundName,
+			AMC:          fund.AMC,
+			MedianReturn: result.RollingReturns.Median,
+			MaxDrawdown:  result.MaxDrawdown,
+			CurrentNAV:   fund.CurrentNAV,
+			LastUpdated:  fund.NAVDate,
+		})
+	}
+
+	if len(entries) == 0 {
+		return fmt.Errorf("no entries for %s %s", category, window)
+	}
+
+	// 4. Sort
+	if sortBy == "median_return" {
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].MedianReturn > entries[j].MedianReturn
+		})
+	} else {
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].MaxDrawdown > entries[j].MaxDrawdown
+		})
+	}
+
+	// 5. Assign ranks
+	for i := range entries {
+		entries[i].Rank = i + 1
+	}
+
+	// 6. Store in Redis
+	ranking := &redisstore.RankingResult{
+		Category:   category,
+		Window:     window,
+		SortBy:     sortBy,
+		TotalFunds: len(entries),
+		ComputedAt: time.Now().UTC(),
+		Funds:      entries,
+	}
+
+	if err := p.rdStore.SetRanking(ctx, ranking); err != nil {
+		return fmt.Errorf("store ranking in redis: %w", err)
+	}
+
+	return nil
+}
+
 // analyticsWorker receives scheme codes and computes analytics
-// Runs concurrently while pipeline fetches next scheme
 func (p *Pipeline) analyticsWorker(ctx context.Context, queue <-chan string) {
 	for schemeCode := range queue {
 		p.logger.Info("computing analytics", zap.String("scheme", schemeCode))
@@ -202,24 +325,10 @@ func (p *Pipeline) analyticsWorker(ctx context.Context, queue <-chan string) {
 
 		p.logger.Info("analytics complete", zap.String("scheme", schemeCode))
 	}
-
-	now := time.Now().UTC()
-	p.setStatus(ctx, &SyncStatus{
-		Status:      "completed",
-		Phase:       "done",
-		CompletedAt: &now,
-	})
-	p.logger.Info("pipeline completed")
 }
 
-// computeAndStoreAnalytics runs the full analytics pipeline for one scheme:
-// 1. Pull NAV history from TimescaleDB
-// 2. Compute analytics for all 4 windows
-// 3. Store in TimescaleDB
-// 4. Push to Redis
-// 5. Update ranking sorted sets
+// computeAndStoreAnalytics runs full analytics for one scheme
 func (p *Pipeline) computeAndStoreAnalytics(ctx context.Context, schemeCode string) error {
-	// 1. Pull full NAV history from TimescaleDB
 	navPoints, err := p.tsStore.GetNAVSeries(ctx, schemeCode)
 	if err != nil {
 		return fmt.Errorf("get nav series: %w", err)
@@ -228,25 +337,9 @@ func (p *Pipeline) computeAndStoreAnalytics(ctx context.Context, schemeCode stri
 		return fmt.Errorf("insufficient NAV data for %s: %d points", schemeCode, len(navPoints))
 	}
 
-	p.logger.Debug("nav series loaded",
-		zap.String("scheme", schemeCode),
-		zap.Int("points", len(navPoints)),
-	)
-
-	// Get fund category for ranking
-	fund, err := p.tsStore.GetFund(ctx, schemeCode)
-	if err != nil {
-		p.logger.Warn("could not get fund category, skipping ranking",
-			zap.String("scheme", schemeCode),
-			zap.Error(err),
-		)
-	}
-
-	// 2. Compute analytics for all 4 windows
 	for _, window := range analyticsWindows {
 		result, err := analytics.Compute(schemeCode, navPoints, window)
 		if err != nil {
-			// Insufficient history for this window — not an error, just skip
 			p.logger.Debug("skipping window (insufficient history)",
 				zap.String("scheme", schemeCode),
 				zap.String("window", window),
@@ -255,9 +348,8 @@ func (p *Pipeline) computeAndStoreAnalytics(ctx context.Context, schemeCode stri
 			continue
 		}
 
-		// 3. Store in TimescaleDB
 		if err := p.tsStore.UpsertAnalytics(ctx, result); err != nil {
-			p.logger.Error("failed to upsert analytics to db",
+			p.logger.Error("failed to upsert analytics",
 				zap.String("scheme", schemeCode),
 				zap.String("window", window),
 				zap.Error(err),
@@ -265,39 +357,13 @@ func (p *Pipeline) computeAndStoreAnalytics(ctx context.Context, schemeCode stri
 			continue
 		}
 
-		// 4. Push to Redis (25hr TTL)
 		if err := p.rdStore.SetAnalytics(ctx, result); err != nil {
-			p.logger.Error("failed to cache analytics in redis",
+			p.logger.Error("failed to cache analytics",
 				zap.String("scheme", schemeCode),
 				zap.String("window", window),
 				zap.Error(err),
 			)
-			// Non-fatal — DB has the data, Redis is just cache
 		}
-
-		// 5. Update ranking sorted set (only if we have fund category)
-		if fund != nil && fund.Category != "" {
-			if err := p.rdStore.UpdateRanking(ctx,
-				fund.Category,
-				window,
-				schemeCode,
-				result.CAGR.Median,
-			); err != nil {
-				p.logger.Error("failed to update ranking",
-					zap.String("scheme", schemeCode),
-					zap.String("window", window),
-					zap.Error(err),
-				)
-				// Non-fatal
-			}
-		}
-
-		p.logger.Debug("analytics stored",
-			zap.String("scheme", schemeCode),
-			zap.String("window", window),
-			zap.Int("periods", result.RollingPeriodsCount),
-			zap.Float64("cagr_median", result.CAGR.Median),
-		)
 	}
 
 	return nil
@@ -317,7 +383,16 @@ func (p *Pipeline) processScheme(ctx context.Context, schemeCode string) error {
 		return fmt.Errorf("fetch scheme: %w", err)
 	}
 
-	if err := p.upsertFund(ctx, fund); err != nil {
+	// Latest NAV is last point after reversal (most recent date)
+	var latestNAV float64
+	var latestDate time.Time
+	if len(navPoints) > 0 {
+		last := navPoints[len(navPoints)-1]
+		latestNAV = last.NAV
+		latestDate = last.Date
+	}
+
+	if err := p.upsertFund(ctx, fund, latestNAV, latestDate); err != nil {
 		return fmt.Errorf("upsert fund: %w", err)
 	}
 
@@ -340,7 +415,7 @@ func (p *Pipeline) processScheme(ctx context.Context, schemeCode string) error {
 		return fmt.Errorf("insert nav: %w", err)
 	}
 
-	latestDate := newPoints[len(newPoints)-1].Date
+	latestDate = newPoints[len(newPoints)-1].Date
 	if err := p.updateSyncState(ctx, schemeCode, latestDate); err != nil {
 		return fmt.Errorf("update sync state: %w", err)
 	}
@@ -360,7 +435,6 @@ func (p *Pipeline) GetStatus(ctx context.Context) (*SyncStatus, error) {
 	if err != nil {
 		return &SyncStatus{Status: "idle"}, nil
 	}
-
 	var status SyncStatus
 	if err := json.Unmarshal([]byte(data), &status); err != nil {
 		return nil, fmt.Errorf("unmarshal status: %w", err)
@@ -375,17 +449,20 @@ func (p *Pipeline) setStatus(ctx context.Context, status *SyncStatus) {
 
 // --- DB helpers ---
 
-func (p *Pipeline) upsertFund(ctx context.Context, fund *fetcher.FundInfo) error {
+func (p *Pipeline) upsertFund(ctx context.Context, fund *fetcher.FundInfo, latestNAV float64, latestDate time.Time) error {
 	_, err := p.tsStore.Pool.Exec(ctx, `
-		INSERT INTO funds (scheme_code, fund_name, amc, category, inception_date, updated_at)
-		VALUES ($1, $2, $3, $4, $5, NOW())
+		INSERT INTO funds (scheme_code, fund_name, amc, category, inception_date, current_nav, nav_date, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 		ON CONFLICT (scheme_code) DO UPDATE
 		SET fund_name      = EXCLUDED.fund_name,
 		    amc            = EXCLUDED.amc,
 		    category       = EXCLUDED.category,
 		    inception_date = COALESCE(funds.inception_date, EXCLUDED.inception_date),
+		    current_nav    = EXCLUDED.current_nav,
+		    nav_date       = EXCLUDED.nav_date,
 		    updated_at     = NOW()
-	`, fund.SchemeCode, fund.FundName, fund.AMC, fund.Category, fund.InceptionDate)
+	`, fund.SchemeCode, fund.FundName, fund.AMC, fund.Category,
+		fund.InceptionDate, latestNAV, latestDate)
 	return err
 }
 
@@ -527,6 +604,16 @@ func (p *Pipeline) ProcessSingleScheme(ctx context.Context, schemeCode string) e
 
 	if err := p.computeAndStoreAnalytics(ctx, schemeCode); err != nil {
 		return fmt.Errorf("compute analytics: %w", err)
+	}
+
+	// Recompute rankings for this scheme's category
+	fund, err := p.tsStore.GetFund(ctx, schemeCode)
+	if err == nil && fund.Category != "" {
+		for _, window := range analyticsWindows {
+			for _, sortBy := range sortByOptions {
+				p.computeRankingForCategory(ctx, fund.Category, window, sortBy)
+			}
+		}
 	}
 
 	p.logger.Info("single scheme processing complete",

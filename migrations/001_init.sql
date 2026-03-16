@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS funds (
     amc             TEXT NOT NULL,
     category        TEXT NOT NULL,
     inception_date  DATE,
+    current_nav     NUMERIC(12, 4),
+    nav_date        DATE,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -52,4 +54,4 @@ CREATE TABLE IF NOT EXISTS tracked_schemes (
     scheme_code TEXT PRIMARY KEY,
     is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
     added_at    TIMESTAMPTZ DEFAULT NOW()
-);    
+);

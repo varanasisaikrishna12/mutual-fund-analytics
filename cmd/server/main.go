@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -169,7 +170,7 @@ func main() {
 	// FUNDS
 	// ─────────────────────────────────────────
 
-	// GET /funds?category=Mid Cap&amc=HDFC
+	// GET /funds?category=&amc=
 	router.GET("/funds", func(c *gin.Context) {
 		category := c.Query("category")
 		amc := c.Query("amc")
@@ -186,7 +187,7 @@ func main() {
 		})
 	})
 
-	// GET /funds/:code — fund details + latest NAV
+	// GET /funds/:code — single fund details + latest NAV from funds table
 	router.GET("/funds/:code", func(c *gin.Context) {
 		code := c.Param("code")
 
@@ -196,28 +197,17 @@ func main() {
 			return
 		}
 
-		nav, navDate, err := tsStore.GetLatestNAV(ctx, code)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"scheme_code": fund.SchemeCode,
-				"fund_name":   fund.FundName,
-				"amc":         fund.AMC,
-				"category":    fund.Category,
-			})
-			return
-		}
-
 		c.JSON(http.StatusOK, gin.H{
 			"scheme_code":  fund.SchemeCode,
 			"fund_name":    fund.FundName,
 			"amc":          fund.AMC,
 			"category":     fund.Category,
-			"current_nav":  nav,
-			"last_updated": navDate.Format("2006-01-02"),
+			"current_nav":  fund.CurrentNAV,
+			"last_updated": fund.NAVDate,
 		})
 	})
 
-	// GET /funds/:code/analytics
+	// GET /funds/:code/analytics?window=
 	router.GET("/funds/:code/analytics", func(c *gin.Context) {
 		code := c.Param("code")
 		window := c.Query("window")
@@ -255,41 +245,27 @@ func main() {
 		// Enrich with fund metadata
 		fund, _ := tsStore.GetFund(ctx, code)
 
-		type AnalyticsResponse struct {
-			FundCode            string      `json:"fund_code"`
-			FundName            string      `json:"fund_name"`
-			Category            string      `json:"category"`
-			AMC                 string      `json:"amc"`
-			Window              string      `json:"window"`
-			DataAvailability    interface{} `json:"data_availability"`
-			RollingPeriodsCount int         `json:"rolling_periods_analyzed"`
-			RollingReturns      interface{} `json:"rolling_returns"`
-			MaxDrawdown         float64     `json:"max_drawdown"`
-			CAGR                interface{} `json:"cagr"`
-			ComputedAt          string      `json:"computed_at"`
-		}
-
-		resp := AnalyticsResponse{
-			FundCode:            result.SchemeCode,
-			Window:              result.Window,
-			DataAvailability:    result.DataAvailability,
-			RollingPeriodsCount: result.RollingPeriodsCount,
-			RollingReturns:      result.RollingReturns,
-			MaxDrawdown:         result.MaxDrawdown,
-			CAGR:                result.CAGR,
-			ComputedAt:          result.ComputedAt.Format(time.RFC3339),
+		resp := gin.H{
+			"fund_code":                result.SchemeCode,
+			"window":                   result.Window,
+			"data_availability":        result.DataAvailability,
+			"rolling_periods_analyzed": result.RollingPeriodsCount,
+			"rolling_returns":          result.RollingReturns,
+			"max_drawdown":             result.MaxDrawdown,
+			"cagr":                     result.CAGR,
+			"computed_at":              result.ComputedAt.Format(time.RFC3339),
 		}
 
 		if fund != nil {
-			resp.FundName = fund.FundName
-			resp.Category = fund.Category
-			resp.AMC = fund.AMC
+			resp["fund_name"] = fund.FundName
+			resp["category"] = fund.Category
+			resp["amc"] = fund.AMC
 		}
 
 		c.JSON(http.StatusOK, resp)
 	})
 
-	// GET /funds/rank
+	// GET /funds/rank?category=&window=&sort_by=&limit=
 	router.GET("/funds/rank", func(c *gin.Context) {
 		category := c.Query("category")
 		window := c.Query("window")
@@ -315,89 +291,90 @@ func main() {
 			limit = 5
 		}
 
-		// Get all funds for this category
-		funds, err := tsStore.GetAllFunds(ctx, category, "")
-		if err != nil || len(funds) == 0 {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": fmt.Sprintf("no funds found for category=%s", category),
-			})
-			return
+		// 1. Try Redis — pre-computed at sync time
+		ranking, err := rdStore.GetRanking(ctx, category, window, sortBy)
+		if err != nil {
+			logger.Error("redis get ranking failed", zap.Error(err))
 		}
 
-		type RankEntry struct {
-			Rank         int     `json:"rank"`
-			FundCode     string  `json:"fund_code"`
-			FundName     string  `json:"fund_name"`
-			AMC          string  `json:"amc"`
-			MedianReturn float64 `json:"median_return"`
-			MaxDrawdown  float64 `json:"max_drawdown"`
-			CurrentNAV   float64 `json:"current_nav"`
-			LastUpdated  string  `json:"last_updated"`
-		}
+		// 2. Cache miss — compute from DB and warm Redis
+		if ranking == nil {
+			logger.Info("ranking cache miss, computing from db",
+				zap.String("category", category),
+				zap.String("window", window),
+				zap.String("sort_by", sortBy),
+			)
 
-		var entries []RankEntry
+			funds, err := tsStore.GetAllFunds(ctx, category, "")
+			if err != nil || len(funds) == 0 {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error": fmt.Sprintf("no funds found for category=%s", category),
+				})
+				return
+			}
 
-		for _, fund := range funds {
-			// Get analytics from Redis or DB
-			result, err := rdStore.GetAnalytics(ctx, fund.SchemeCode, window)
-			if err != nil || result == nil {
-				result, err = tsStore.GetAnalyticsFromDB(ctx, fund.SchemeCode, window)
-				if err != nil {
+			analyticsMap, _ := tsStore.GetAllAnalyticsForCategory(ctx, category, window)
+
+			var entries []redisstore.RankEntry
+			for _, fund := range funds {
+				result, ok := analyticsMap[fund.SchemeCode]
+				if !ok {
 					continue
 				}
+				entries = append(entries, redisstore.RankEntry{
+					FundCode:     fund.SchemeCode,
+					FundName:     fund.FundName,
+					AMC:          fund.AMC,
+					MedianReturn: result.RollingReturns.Median,
+					MaxDrawdown:  result.MaxDrawdown,
+					CurrentNAV:   fund.CurrentNAV,
+					LastUpdated:  fund.NAVDate,
+				})
 			}
 
-			nav, navDate, _ := tsStore.GetLatestNAV(ctx, fund.SchemeCode)
-
-			entries = append(entries, RankEntry{
-				FundCode:     fund.SchemeCode,
-				FundName:     fund.FundName,
-				AMC:          fund.AMC,
-				MedianReturn: result.RollingReturns.Median,
-				MaxDrawdown:  result.MaxDrawdown,
-				CurrentNAV:   nav,
-				LastUpdated:  navDate.Format("2006-01-02"),
-			})
-		}
-
-		// Sort based on sort_by parameter
-		if sortBy == "median_return" {
-			// Sort descending by median return
-			for i := 0; i < len(entries)-1; i++ {
-				for j := i + 1; j < len(entries); j++ {
-					if entries[j].MedianReturn > entries[i].MedianReturn {
-						entries[i], entries[j] = entries[j], entries[i]
-					}
-				}
+			if sortBy == "median_return" {
+				sort.Slice(entries, func(i, j int) bool {
+					return entries[i].MedianReturn > entries[j].MedianReturn
+				})
+			} else {
+				sort.Slice(entries, func(i, j int) bool {
+					return entries[i].MaxDrawdown > entries[j].MaxDrawdown
+				})
 			}
-		} else if sortBy == "max_drawdown" {
-			// Sort descending by max_drawdown (less negative = better)
-			for i := 0; i < len(entries)-1; i++ {
-				for j := i + 1; j < len(entries); j++ {
-					if entries[j].MaxDrawdown > entries[i].MaxDrawdown {
-						entries[i], entries[j] = entries[j], entries[i]
-					}
-				}
+
+			for i := range entries {
+				entries[i].Rank = i + 1
+			}
+
+			ranking = &redisstore.RankingResult{
+				Category:   category,
+				Window:     window,
+				SortBy:     sortBy,
+				TotalFunds: len(entries),
+				ComputedAt: time.Now().UTC(),
+				Funds:      entries,
+			}
+
+			if err := rdStore.SetRanking(ctx, ranking); err != nil {
+				logger.Warn("failed to cache ranking", zap.Error(err))
 			}
 		}
 
-		// Apply rank and limit
-		totalFunds := len(entries)
-		if limit > totalFunds {
-			limit = totalFunds
+		// Apply limit
+		funds := ranking.Funds
+		if limit > len(funds) {
+			limit = len(funds)
 		}
-		entries = entries[:limit]
-		for i := range entries {
-			entries[i].Rank = i + 1
-		}
+		funds = funds[:limit]
 
 		c.JSON(http.StatusOK, gin.H{
-			"category":    category,
-			"window":      window,
-			"sorted_by":   sortBy,
-			"total_funds": totalFunds,
-			"showing":     len(entries),
-			"funds":       entries,
+			"category":    ranking.Category,
+			"window":      ranking.Window,
+			"sorted_by":   ranking.SortBy,
+			"total_funds": ranking.TotalFunds,
+			"showing":     len(funds),
+			"computed_at": ranking.ComputedAt,
+			"funds":       funds,
 		})
 	})
 

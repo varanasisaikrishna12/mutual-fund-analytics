@@ -20,6 +20,13 @@ type FundRow struct {
 	FundName   string
 	AMC        string
 	Category   string
+	CurrentNAV float64
+	NAVDate    string
+}
+
+type NAVInfo struct {
+	NAV  float64
+	Date time.Time
 }
 
 func New(ctx context.Context, dbURL string) (*Store, error) {
@@ -135,32 +142,50 @@ func (s *Store) UpsertAnalytics(ctx context.Context, result *analytics.Analytics
 	}
 
 	_, err = s.Pool.Exec(ctx, `
-    INSERT INTO analytics_results (scheme_code, win_window, result_json, computed_at)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (scheme_code, win_window) DO UPDATE
-    SET result_json = EXCLUDED.result_json,
-        computed_at = EXCLUDED.computed_at
-`, result.SchemeCode, result.Window, data, result.ComputedAt)
+		INSERT INTO analytics_results (scheme_code, win_window, result_json, computed_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (scheme_code, win_window) DO UPDATE
+		SET result_json = EXCLUDED.result_json,
+		    computed_at = EXCLUDED.computed_at
+	`, result.SchemeCode, result.Window, data, result.ComputedAt)
 
 	return err
 }
 
-// GetFund returns fund metadata
+// GetFund returns fund metadata including latest NAV — single query, fast
 func (s *Store) GetFund(ctx context.Context, schemeCode string) (*FundRow, error) {
 	var f FundRow
+	var navDate *time.Time
+	var currentNAV *float64
+
 	err := s.Pool.QueryRow(ctx, `
-		SELECT scheme_code, fund_name, amc, category
+		SELECT scheme_code, fund_name, amc, category,
+		       current_nav, nav_date
 		FROM funds WHERE scheme_code = $1
-	`, schemeCode).Scan(&f.SchemeCode, &f.FundName, &f.AMC, &f.Category)
+	`, schemeCode).Scan(
+		&f.SchemeCode, &f.FundName, &f.AMC, &f.Category,
+		&currentNAV, &navDate,
+	)
 	if err != nil {
 		return nil, err
 	}
+
+	if currentNAV != nil {
+		f.CurrentNAV = *currentNAV
+	}
+	if navDate != nil {
+		f.NAVDate = navDate.Format("2006-01-02")
+	}
+
 	return &f, nil
 }
 
 // GetAllFunds returns all funds with optional category/amc filters
 func (s *Store) GetAllFunds(ctx context.Context, category, amc string) ([]FundRow, error) {
-	query := `SELECT scheme_code, fund_name, amc, category FROM funds WHERE 1=1`
+	query := `
+		SELECT scheme_code, fund_name, amc, category,
+		       COALESCE(current_nav, 0), COALESCE(nav_date::text, '')
+		FROM funds WHERE 1=1`
 	args := []interface{}{}
 	idx := 1
 
@@ -184,7 +209,10 @@ func (s *Store) GetAllFunds(ctx context.Context, category, amc string) ([]FundRo
 	var funds []FundRow
 	for rows.Next() {
 		var f FundRow
-		if err := rows.Scan(&f.SchemeCode, &f.FundName, &f.AMC, &f.Category); err != nil {
+		if err := rows.Scan(
+			&f.SchemeCode, &f.FundName, &f.AMC, &f.Category,
+			&f.CurrentNAV, &f.NAVDate,
+		); err != nil {
 			continue
 		}
 		funds = append(funds, f)
@@ -192,8 +220,47 @@ func (s *Store) GetAllFunds(ctx context.Context, category, amc string) ([]FundRo
 	return funds, nil
 }
 
+// GetFundsBySchemes returns fund metadata for multiple scheme codes in one query
+func (s *Store) GetFundsBySchemes(ctx context.Context, codes []string) (map[string]*FundRow, error) {
+	if len(codes) == 0 {
+		return map[string]*FundRow{}, nil
+	}
+
+	args := make([]interface{}, len(codes))
+	placeholders := ""
+	for i, code := range codes {
+		args[i] = code
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += fmt.Sprintf("$%d", i+1)
+	}
+
+	rows, err := s.Pool.Query(ctx, fmt.Sprintf(`
+		SELECT scheme_code, fund_name, amc, category,
+		       COALESCE(current_nav, 0), COALESCE(nav_date::text, '')
+		FROM funds WHERE scheme_code IN (%s)
+	`, placeholders), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]*FundRow)
+	for rows.Next() {
+		var f FundRow
+		if err := rows.Scan(
+			&f.SchemeCode, &f.FundName, &f.AMC, &f.Category,
+			&f.CurrentNAV, &f.NAVDate,
+		); err != nil {
+			continue
+		}
+		result[f.SchemeCode] = &f
+	}
+	return result, nil
+}
+
 // GetAnalyticsFromDB returns analytics result from DB
-// Used as fallback when Redis cache misses
 func (s *Store) GetAnalyticsFromDB(ctx context.Context, schemeCode, window string) (*analytics.AnalyticsResult, error) {
 	var data []byte
 	err := s.Pool.QueryRow(ctx, `
@@ -211,26 +278,42 @@ func (s *Store) GetAnalyticsFromDB(ctx context.Context, schemeCode, window strin
 	return &result, nil
 }
 
-// GetAnalyticsComputedAt returns when analytics were last computed
-func (s *Store) GetAnalyticsComputedAt(ctx context.Context, schemeCode, window string) (*time.Time, error) {
-	var t time.Time
-	err := s.Pool.QueryRow(ctx, `
-		SELECT computed_at FROM analytics_results
-		WHERE scheme_code = $1 AND win_window = $2
-	`, schemeCode, window).Scan(&t)
+// GetAllAnalyticsForCategory returns analytics for all schemes in a category in one query
+func (s *Store) GetAllAnalyticsForCategory(ctx context.Context, category, window string) (map[string]*analytics.AnalyticsResult, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT a.scheme_code, a.result_json
+		FROM analytics_results a
+		JOIN funds f ON f.scheme_code = a.scheme_code
+		WHERE LOWER(f.category) = LOWER($1)
+		AND a.win_window = $2
+	`, category, window)
 	if err != nil {
 		return nil, err
 	}
-	return &t, nil
+	defer rows.Close()
+
+	results := make(map[string]*analytics.AnalyticsResult)
+	for rows.Next() {
+		var code string
+		var data []byte
+		if err := rows.Scan(&code, &data); err != nil {
+			continue
+		}
+		var result analytics.AnalyticsResult
+		if err := json.Unmarshal(data, &result); err != nil {
+			continue
+		}
+		results[code] = &result
+	}
+	return results, nil
 }
 
-// GetFundsBySchemes returns fund metadata for multiple scheme codes in one query
-func (s *Store) GetFundsBySchemes(ctx context.Context, codes []string) (map[string]*FundRow, error) {
+// GetLatestNAVBatch returns latest NAV for multiple schemes in one query
+func (s *Store) GetLatestNAVBatch(ctx context.Context, codes []string) (map[string]NAVInfo, error) {
 	if len(codes) == 0 {
-		return map[string]*FundRow{}, nil
+		return map[string]NAVInfo{}, nil
 	}
 
-	// Build $1,$2,$3... placeholders
 	args := make([]interface{}, len(codes))
 	placeholders := ""
 	for i, code := range codes {
@@ -242,7 +325,7 @@ func (s *Store) GetFundsBySchemes(ctx context.Context, codes []string) (map[stri
 	}
 
 	rows, err := s.Pool.Query(ctx, fmt.Sprintf(`
-		SELECT scheme_code, fund_name, amc, category
+		SELECT scheme_code, COALESCE(current_nav, 0), COALESCE(nav_date, NOW()::date)
 		FROM funds
 		WHERE scheme_code IN (%s)
 	`, placeholders), args...)
@@ -251,30 +334,27 @@ func (s *Store) GetFundsBySchemes(ctx context.Context, codes []string) (map[stri
 	}
 	defer rows.Close()
 
-	result := make(map[string]*FundRow)
+	result := make(map[string]NAVInfo)
 	for rows.Next() {
-		var f FundRow
-		if err := rows.Scan(&f.SchemeCode, &f.FundName, &f.AMC, &f.Category); err != nil {
+		var code string
+		var info NAVInfo
+		if err := rows.Scan(&code, &info.NAV, &info.Date); err != nil {
 			continue
 		}
-		result[f.SchemeCode] = &f
+		result[code] = info
 	}
 	return result, nil
 }
 
-// GetLatestNAV returns the most recent NAV value and date for a scheme
-func (s *Store) GetLatestNAV(ctx context.Context, schemeCode string) (float64, time.Time, error) {
-	var nav float64
-	var date time.Time
+// GetAnalyticsComputedAt returns when analytics were last computed
+func (s *Store) GetAnalyticsComputedAt(ctx context.Context, schemeCode, window string) (*time.Time, error) {
+	var t time.Time
 	err := s.Pool.QueryRow(ctx, `
-		SELECT nav_value, nav_date
-		FROM nav_data
-		WHERE scheme_code = $1
-		ORDER BY nav_date DESC
-		LIMIT 1
-	`, schemeCode).Scan(&nav, &date)
+		SELECT computed_at FROM analytics_results
+		WHERE scheme_code = $1 AND win_window = $2
+	`, schemeCode, window).Scan(&t)
 	if err != nil {
-		return 0, time.Time{}, err
+		return nil, err
 	}
-	return nav, date, nil
+	return &t, nil
 }

@@ -30,29 +30,25 @@ func (s *Store) Close() error {
 }
 
 // SetAnalytics stores analytics result in Redis with 25hr TTL
-// Key: fund:{schemeCode}:analytics:{window}
 func (s *Store) SetAnalytics(ctx context.Context, result *analytics.AnalyticsResult) error {
 	data, err := json.Marshal(result)
 	if err != nil {
 		return fmt.Errorf("marshal analytics: %w", err)
 	}
-
 	key := fmt.Sprintf("fund:%s:analytics:%s", result.SchemeCode, result.Window)
 	return s.Client.Set(ctx, key, data, 25*time.Hour).Err()
 }
 
 // GetAnalytics reads analytics result from Redis
-// Returns nil, nil if key does not exist (cache miss)
 func (s *Store) GetAnalytics(ctx context.Context, schemeCode, window string) (*analytics.AnalyticsResult, error) {
 	key := fmt.Sprintf("fund:%s:analytics:%s", schemeCode, window)
 	data, err := s.Client.Get(ctx, key).Bytes()
 	if err == redis.Nil {
-		return nil, nil // cache miss
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("redis get analytics: %w", err)
 	}
-
 	var result analytics.AnalyticsResult
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
@@ -60,32 +56,67 @@ func (s *Store) GetAnalytics(ctx context.Context, schemeCode, window string) (*a
 	return &result, nil
 }
 
-// UpdateRanking updates the sorted set for fund ranking
-// Key: rank:{category}:{window}
-// Score: CAGR median (higher = better rank)
-func (s *Store) UpdateRanking(ctx context.Context, category, window, schemeCode string, cagrMedian float64) error {
-	key := fmt.Sprintf("rank:%s:%s",
-		normalizeCategory(category),
-		window,
-	)
-	return s.Client.ZAdd(ctx, key, redis.Z{
-		Score:  cagrMedian,
-		Member: schemeCode,
-	}).Err()
+// RankEntry is a single entry in a ranking list
+type RankEntry struct {
+	Rank         int     `json:"rank"`
+	FundCode     string  `json:"fund_code"`
+	FundName     string  `json:"fund_name"`
+	AMC          string  `json:"amc"`
+	MedianReturn float64 `json:"median_return"`
+	MaxDrawdown  float64 `json:"max_drawdown"`
+	CurrentNAV   float64 `json:"current_nav"`
+	LastUpdated  string  `json:"last_updated"`
 }
 
-// GetRanking returns top N funds for a category+window sorted by CAGR median
-func (s *Store) GetRanking(ctx context.Context, category, window string, limit int) ([]redis.Z, error) {
-	key := fmt.Sprintf("rank:%s:%s",
+// RankingResult is the full ranking response stored in Redis
+type RankingResult struct {
+	Category   string      `json:"category"`
+	Window     string      `json:"window"`
+	SortBy     string      `json:"sorted_by"`
+	TotalFunds int         `json:"total_funds"`
+	ComputedAt time.Time   `json:"computed_at"`
+	Funds      []RankEntry `json:"funds"`
+}
+
+// SetRanking stores a full ranking result in Redis with 25hr TTL
+// key: rank:{category}:{window}:{sort_by}
+func (s *Store) SetRanking(ctx context.Context, result *RankingResult) error {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal ranking: %w", err)
+	}
+	key := rankingKey(result.Category, result.Window, result.SortBy)
+	return s.Client.Set(ctx, key, data, 25*time.Hour).Err()
+}
+
+// GetRanking reads a ranking result from Redis
+// Returns nil, nil on cache miss
+func (s *Store) GetRanking(ctx context.Context, category, window, sortBy string) (*RankingResult, error) {
+	key := rankingKey(category, window, sortBy)
+	data, err := s.Client.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redis get ranking: %w", err)
+	}
+	var result RankingResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// rankingKey builds the Redis key for a ranking
+func rankingKey(category, window, sortBy string) string {
+	return fmt.Sprintf("rank:%s:%s:%s",
 		normalizeCategory(category),
 		window,
+		sortBy,
 	)
-	// ZRevRangeWithScores → highest score first
-	return s.Client.ZRevRangeWithScores(ctx, key, 0, int64(limit-1)).Result()
 }
 
 // normalizeCategory lowercases and replaces spaces with underscores
-// "Mid Cap" → "mid_cap"
 func normalizeCategory(category string) string {
 	result := ""
 	for _, c := range category {
